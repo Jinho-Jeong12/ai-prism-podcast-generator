@@ -2,3 +2,7 @@ ffmpeg/
 __pycache__/
 *.pyc
 *.mp4
+.podcast_config.json
+.claude/
+_tmp_*.aac
+_tmp_*.mp4
