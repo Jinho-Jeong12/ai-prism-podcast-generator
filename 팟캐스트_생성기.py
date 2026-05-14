@@ -361,7 +361,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("AI Prism 팟캐스트 생성기")
-        self.resizable(False, False)
+        self.resizable(False, True)
         self.configure(bg=self.C["BG"])
         self._cfg   = load_config()
         self._tasks: list[TaskCard] = []
@@ -371,10 +371,19 @@ class App(tk.Tk):
 
     def _center(self):
         self.update_idletasks()
-        w, h = 620, 560
+        w, h = 640, 680
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _on_frame_configure(self, _event=None):
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self._canvas.itemconfig(self._canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     # ── UI 구성 ─────────────────────────────────────────────
     def _build_ui(self):
@@ -406,11 +415,29 @@ class App(tk.Tk):
                   font=self.FONT_B, relief="flat", padx=10, cursor="hand2",
                   command=self._browse_output).pack(side="right")
 
-        # 작업 목록 컨테이너
+        # 작업 목록 컨테이너 (스크롤 가능)
         tk.Label(body, text=f"작업 목록 (최대 {MAX_TASKS}개)", bg=C["BG"], fg=C["MUTED"],
                  font=("Malgun Gothic", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
-        self._task_frame = tk.Frame(body, bg=C["BG"])
-        self._task_frame.pack(fill="x")
+
+        scroll_wrap = tk.Frame(body, bg=C["BG"])
+        scroll_wrap.pack(fill="both", expand=True, pady=(0, 0))
+
+        self._canvas = tk.Canvas(scroll_wrap, bg=C["BG"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(scroll_wrap, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        self._task_frame = tk.Frame(self._canvas, bg=C["BG"])
+        self._canvas_window = self._canvas.create_window((0, 0), window=self._task_frame, anchor="nw")
+
+        self._task_frame.bind("<Configure>", self._on_frame_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # 마우스 휠 스크롤
+        self._canvas.bind("<Enter>", lambda _: self._canvas.bind_all("<MouseWheel>", self._on_mousewheel))
+        self._canvas.bind("<Leave>", lambda _: self._canvas.unbind_all("<MouseWheel>"))
 
         # 하단 버튼 영역
         btn_row = tk.Frame(body, bg=C["BG"])
