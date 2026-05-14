@@ -5,6 +5,7 @@ import os
 import json
 import threading
 import shutil
+import uuid
 from pathlib import Path
 
 BASE_DIR    = Path(__file__).parent
@@ -29,6 +30,8 @@ CATEGORIES = [
     "Students & Grads",
 ]
 
+MAX_TASKS = 6
+
 
 # ─── 설정 저장/불러오기 ────────────────────────────────────
 def load_config():
@@ -47,7 +50,6 @@ def save_config(data):
 
 # ─── FFmpeg 탐색 ──────────────────────────────────────────
 def default_desktop():
-    """OneDrive 동기화 데스크탑 → 일반 데스크탑 순으로 반환."""
     for p in [
         Path.home() / "OneDrive" / "Desktop",
         Path.home() / "Desktop",
@@ -58,7 +60,6 @@ def default_desktop():
 
 
 def _try_ffmpeg(ff: str) -> bool:
-    """ffmpeg 실행 가능 여부를 실제로 확인 (보안 정책 차단 감지)."""
     try:
         r = subprocess.run([ff, "-version"], capture_output=True, timeout=5)
         return r.returncode == 0
@@ -67,21 +68,17 @@ def _try_ffmpeg(ff: str) -> bool:
 
 
 def find_ffmpeg():
-    """실행 가능한 ffmpeg 를 탐색. 없으면 (None, None)."""
     candidates = []
 
-    # 1) winget 설치 경로 (Gyan.FFmpeg) — 보안 서명 있어 우선
     winget_base = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages"
     if winget_base.exists():
         for pkg in winget_base.glob("Gyan.FFmpeg_*"):
             for ff in sorted(pkg.rglob("bin/ffmpeg.exe"), reverse=True):
                 candidates.append((str(ff), str(ff.parent / "ffprobe.exe")))
 
-    # 2) 시스템 PATH
     if shutil.which("ffmpeg"):
         candidates.append(("ffmpeg", "ffprobe"))
 
-    # 3) 로컬 폴더 (보안 정책에 따라 차단될 수 있음)
     local = BASE_DIR / "ffmpeg" / "bin" / "ffmpeg.exe"
     if local.exists():
         candidates.append((str(local), str(local.parent / "ffprobe.exe")))
@@ -103,7 +100,7 @@ def get_audio_duration(ffprobe, path):
     return float(json.loads(r.stdout)["format"]["duration"])
 
 
-def build_video(category, podcast_path, output_path, progress_cb, log_cb):
+def build_video(category, podcast_path, output_path, progress_cb, log_cb, task_id=""):
     ffmpeg, ffprobe = find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError(
@@ -130,11 +127,11 @@ def build_video(category, podcast_path, output_path, progress_cb, log_cb):
     log_cb("🎚️  오디오 합치는 중...")
     progress_cb(25)
 
-    # 보안 정책상 systemp 폴더 접근이 막힐 수 있어 프로젝트 폴더 내 임시 파일 사용
-    tmp_audio  = BASE_DIR / "_tmp_combined.aac"
-    tmp_output = BASE_DIR / "_tmp_output.mp4"
+    # 동시 작업 시 임시 파일 충돌 방지를 위해 고유 ID 사용
+    uid = task_id or uuid.uuid4().hex[:8]
+    tmp_audio  = BASE_DIR / f"_tmp_combined_{uid}.aac"
+    tmp_output = BASE_DIR / f"_tmp_output_{uid}.mp4"
 
-    # ffmpeg stderr는 UTF-8로 출력되므로 명시적으로 지정
     def run_ff(*args):
         return subprocess.run(
             list(args), capture_output=True,
@@ -165,7 +162,6 @@ def build_video(category, podcast_path, output_path, progress_cb, log_cb):
         log_cb("🎬 영상 렌더링 중...")
         progress_cb(60)
 
-        # 출력 파일명에 [] 포함 시 ffmpeg가 특수문자로 오인 → 임시 파일로 먼저 저장 후 이동
         r = run_ff(
             ffmpeg, "-y",
             "-loop", "1",
@@ -186,164 +182,254 @@ def build_video(category, podcast_path, output_path, progress_cb, log_cb):
 
         shutil.move(str(tmp_output), str(output_path))
         progress_cb(100)
-        log_cb(f"✅ 완료! 저장 위치: {output_path}")
+        log_cb(f"✅ 완료! {Path(output_path).name}")
 
     finally:
         tmp_audio.unlink(missing_ok=True)
         tmp_output.unlink(missing_ok=True)
 
 
+# ─── 단일 작업 카드 ───────────────────────────────────────
+class TaskCard(tk.Frame):
+    COLORS = {
+        "BG":    "#1a1a2e",
+        "CARD":  "#16213e",
+        "ACCENT":"#0f3460",
+        "HL":    "#e94560",
+        "FG":    "#eaeaea",
+        "MUTED": "#8892b0",
+        "GREEN": "#4caf50",
+    }
+    FONT   = ("Malgun Gothic", 9)
+    FONT_B = ("Malgun Gothic", 9, "bold")
+
+    def __init__(self, parent, index: int, get_output_dir, on_remove, **kw):
+        C = self.COLORS
+        super().__init__(parent, bg=C["CARD"], padx=10, pady=8,
+                         highlightbackground=C["ACCENT"], highlightthickness=1, **kw)
+        self._index         = index
+        self._get_output    = get_output_dir
+        self._on_remove     = on_remove
+        self._podcast_path  = ""
+        self._task_id       = uuid.uuid4().hex[:8]
+        self._running       = False
+        self._build()
+
+    def _build(self):
+        C = self.COLORS
+
+        # 상단 행: 번호 + 카테고리 + 삭제 버튼
+        top = tk.Frame(self, bg=C["CARD"])
+        top.pack(fill="x", pady=(0, 6))
+
+        tk.Label(top, text=f"작업 {self._index}", bg=C["CARD"], fg=C["HL"],
+                 font=self.FONT_B, width=6, anchor="w").pack(side="left")
+
+        self.category_var = tk.StringVar(value=CATEGORIES[0])
+        style = ttk.Style()
+        style.configure("Card.TCombobox",
+                        fieldbackground=C["CARD"], background=C["CARD"],
+                        foreground=C["FG"], selectbackground=C["ACCENT"],
+                        selectforeground=C["FG"])
+        cb = ttk.Combobox(top, textvariable=self.category_var,
+                          values=CATEGORIES, state="readonly",
+                          style="Card.TCombobox", font=self.FONT, width=22)
+        cb.pack(side="left", padx=(0, 6))
+
+        self._del_btn = tk.Button(top, text="✕", bg=C["ACCENT"], fg=C["MUTED"],
+                                  font=self.FONT, relief="flat", padx=6,
+                                  cursor="hand2", command=self._on_remove)
+        self._del_btn.pack(side="right")
+
+        # 중단 행: 파일 경로 + 찾아보기
+        mid = tk.Frame(self, bg=C["CARD"])
+        mid.pack(fill="x", pady=(0, 6))
+
+        self.file_var = tk.StringVar(value="파일을 선택해 주세요")
+        tk.Label(mid, textvariable=self.file_var, bg=C["CARD"], fg=C["FG"],
+                 font=self.FONT, anchor="w", wraplength=340,
+                 justify="left").pack(side="left", fill="x", expand=True)
+        tk.Button(mid, text="📂", bg=C["ACCENT"], fg=C["FG"],
+                  font=self.FONT_B, relief="flat", padx=8, cursor="hand2",
+                  command=self._browse).pack(side="right")
+
+        # 하단 행: 진행바 + 생성 버튼
+        bot = tk.Frame(self, bg=C["CARD"])
+        bot.pack(fill="x")
+
+        prog_frame = tk.Frame(bot, bg=C["CARD"])
+        prog_frame.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        style.configure(f"Task{self._index}.Horizontal.TProgressbar",
+                        troughcolor=C["ACCENT"], background=C["HL"], thickness=5)
+        self.progress = ttk.Progressbar(prog_frame,
+                                        style=f"Task{self._index}.Horizontal.TProgressbar",
+                                        length=300, mode="determinate")
+        self.progress.pack(fill="x")
+
+        self.status_var = tk.StringVar(value="대기 중")
+        tk.Label(prog_frame, textvariable=self.status_var, bg=C["CARD"],
+                 fg=C["MUTED"], font=("Malgun Gothic", 8), anchor="w").pack(fill="x")
+
+        self.gen_btn = tk.Button(bot, text="▶ 생성",
+                                 bg=C["HL"], fg="white", font=self.FONT_B,
+                                 relief="flat", padx=10, pady=4, cursor="hand2",
+                                 command=self.start)
+        self.gen_btn.pack(side="right")
+
+    def _browse(self):
+        path = filedialog.askopenfilename(
+            title="팟캐스트 음성 파일 선택",
+            filetypes=[("오디오 파일", "*.mp3 *.wav *.m4a *.aac *.ogg"), ("모든 파일", "*.*")],
+        )
+        if path:
+            self._podcast_path = path
+            self.file_var.set(Path(path).name)
+
+    def set_index(self, idx: int):
+        self._index = idx
+
+    def is_ready(self) -> bool:
+        return bool(self._podcast_path) and os.path.exists(self._podcast_path)
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def start(self):
+        if self._running:
+            return
+        if not self.is_ready():
+            messagebox.showwarning("파일 없음", f"작업 {self._index}: 팟캐스트 파일을 먼저 선택해 주세요.")
+            return
+
+        ffmpeg, _ = find_ffmpeg()
+        if not ffmpeg:
+            messagebox.showerror("FFmpeg 없음",
+                                 "FFmpeg 가 설치되어 있지 않습니다.\n"
+                                 "'팟캐스트 생성기 실행.bat' 파일을 통해 실행해 주세요.")
+            return
+
+        category = self.category_var.get()
+        out_dir  = Path(self._get_output())
+        stem     = Path(self._podcast_path).stem
+        out_file = out_dir / f"[AI Prism] {category} - {stem}.mp4"
+
+        if out_file.exists():
+            if not messagebox.askyesno("파일 덮어쓰기",
+                                       f"이미 존재합니다:\n{out_file.name}\n\n덮어쓰겠습니까?"):
+                return
+
+        self._running = True
+        self.gen_btn.config(state="disabled")
+        self._del_btn.config(state="disabled")
+        self.progress["value"] = 0
+
+        def run():
+            try:
+                build_video(
+                    category, self._podcast_path, out_file,
+                    progress_cb=lambda v: self.after(0, lambda: self.progress.configure(value=v)),
+                    log_cb=lambda m: self.after(0, lambda msg=m: self.status_var.set(msg)),
+                    task_id=self._task_id,
+                )
+            except Exception as e:
+                self.after(0, lambda err=str(e): messagebox.showerror(
+                    f"작업 {self._index} 오류", err))
+                self.after(0, lambda: self.status_var.set("❌ 오류 발생"))
+                self.after(0, lambda: self.progress.configure(value=0))
+            finally:
+                self._running = False
+                self.after(0, lambda: self.gen_btn.config(state="normal"))
+                self.after(0, lambda: self._del_btn.config(state="normal"))
+
+        threading.Thread(target=run, daemon=True).start()
+
+
 # ─── GUI ──────────────────────────────────────────────────
 class App(tk.Tk):
+    C = {
+        "BG":    "#1a1a2e",
+        "CARD":  "#16213e",
+        "ACCENT":"#0f3460",
+        "HL":    "#e94560",
+        "FG":    "#eaeaea",
+        "MUTED": "#8892b0",
+    }
+    FONT   = ("Malgun Gothic", 10)
+    FONT_B = ("Malgun Gothic", 10, "bold")
+
     def __init__(self):
         super().__init__()
         self.title("AI Prism 팟캐스트 생성기")
         self.resizable(False, False)
-        self.configure(bg="#1a1a2e")
+        self.configure(bg=self.C["BG"])
         self._cfg   = load_config()
-        self._thumb = None          # PhotoImage GC 방지용
+        self._tasks: list[TaskCard] = []
         self._build_ui()
         self._center()
-        self._refresh_thumb()       # 초기 썸네일 로드
+        self._add_task()   # 기본 1개
 
     def _center(self):
         self.update_idletasks()
-        w, h = 640, 640
+        w, h = 620, 560
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
 
     # ── UI 구성 ─────────────────────────────────────────────
     def _build_ui(self):
-        BG     = "#1a1a2e"
-        CARD   = "#16213e"
-        ACCENT = "#0f3460"
-        HL     = "#e94560"
-        FG     = "#eaeaea"
-        MUTED  = "#8892b0"
-        FONT   = ("Malgun Gothic", 10)
-        FONT_B = ("Malgun Gothic", 10, "bold")
+        C = self.C
 
         # 헤더
-        hdr = tk.Frame(self, bg=HL, pady=15)
+        hdr = tk.Frame(self, bg=C["HL"], pady=12)
         hdr.pack(fill="x")
         tk.Label(hdr, text="🎙 AI Prism 팟캐스트 생성기",
-                 font=("Malgun Gothic", 16, "bold"), bg=HL, fg="white").pack()
+                 font=("Malgun Gothic", 15, "bold"), bg=C["HL"], fg="white").pack()
         tk.Label(hdr, text="Seoul Economic Daily",
-                 font=("Malgun Gothic", 9), bg=HL, fg="#ffd6d6").pack()
+                 font=("Malgun Gothic", 9), bg=C["HL"], fg="#ffd6d6").pack()
 
-        body = tk.Frame(self, bg=BG, padx=28, pady=16)
+        body = tk.Frame(self, bg=C["BG"], padx=20, pady=12)
         body.pack(fill="both", expand=True)
 
-        # ① 카테고리
-        self._sec(body, BG, MUTED, "① 카테고리 선택")
-        cat_card = tk.Frame(body, bg=CARD, pady=8, padx=10)
-        cat_card.pack(fill="x", pady=(0, 6))
-
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Dark.TCombobox",
-                        fieldbackground=CARD, background=CARD,
-                        foreground=FG, selectbackground=ACCENT, selectforeground=FG)
-
-        self.category_var = tk.StringVar(
-            value=self._cfg.get("last_category", CATEGORIES[0])
-        )
-        cb = ttk.Combobox(
-            cat_card, textvariable=self.category_var,
-            values=CATEGORIES, state="readonly",
-            style="Dark.TCombobox", font=FONT, width=38,
-        )
-        cb.pack(fill="x")
-        cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_thumb())
-
-        # 카테고리 썸네일
-        self._thumb_lbl = tk.Label(body, bg=BG)
-        self._thumb_lbl.pack(pady=(4, 10))
-
-        # ② 팟캐스트 파일
-        self._sec(body, BG, MUTED, "② 팟캐스트 음성 파일 선택 (.mp3 / .wav / .m4a)")
-        file_card = tk.Frame(body, bg=CARD, pady=8, padx=10)
-        file_card.pack(fill="x", pady=(0, 12))
-        self.podcast_var = tk.StringVar(value="파일을 선택해 주세요")
-        tk.Label(file_card, textvariable=self.podcast_var,
-                 bg=CARD, fg=FG, font=FONT,
-                 anchor="w", wraplength=430, justify="left").pack(side="left", fill="x", expand=True)
-        tk.Button(file_card, text="📂 찾아보기",
-                  bg=ACCENT, fg=FG, font=FONT_B, relief="flat", padx=10, cursor="hand2",
-                  command=self._browse_podcast).pack(side="right")
-
-        # ③ 저장 위치
-        self._sec(body, BG, MUTED, "③ 저장 위치")
-        out_card = tk.Frame(body, bg=CARD, pady=8, padx=10)
-        out_card.pack(fill="x", pady=(0, 16))
+        # 저장 위치 (공통)
+        tk.Label(body, text="저장 위치", bg=C["BG"], fg=C["MUTED"],
+                 font=("Malgun Gothic", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 3))
+        out_card = tk.Frame(body, bg=C["CARD"], pady=6, padx=10)
+        out_card.pack(fill="x", pady=(0, 10))
         self.output_var = tk.StringVar(
             value=self._cfg.get("last_output", str(default_desktop()))
         )
-        tk.Label(out_card, textvariable=self.output_var,
-                 bg=CARD, fg=FG, font=FONT,
-                 anchor="w", wraplength=430, justify="left").pack(side="left", fill="x", expand=True)
-        tk.Button(out_card, text="📁 폴더 선택",
-                  bg=ACCENT, fg=FG, font=FONT_B, relief="flat", padx=10, cursor="hand2",
+        tk.Label(out_card, textvariable=self.output_var, bg=C["CARD"], fg=C["FG"],
+                 font=self.FONT, anchor="w", wraplength=450,
+                 justify="left").pack(side="left", fill="x", expand=True)
+        tk.Button(out_card, text="📁 폴더 선택", bg=C["ACCENT"], fg=C["FG"],
+                  font=self.FONT_B, relief="flat", padx=10, cursor="hand2",
                   command=self._browse_output).pack(side="right")
 
-        # 생성 버튼
-        self.gen_btn = tk.Button(
-            body, text="🎬  영상 생성하기",
-            bg=HL, fg="white", font=("Malgun Gothic", 12, "bold"),
-            relief="flat", pady=10, cursor="hand2",
-            command=self._start_generate,
-        )
-        self.gen_btn.pack(fill="x", pady=(0, 10))
+        # 작업 목록 컨테이너
+        tk.Label(body, text=f"작업 목록 (최대 {MAX_TASKS}개)", bg=C["BG"], fg=C["MUTED"],
+                 font=("Malgun Gothic", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
+        self._task_frame = tk.Frame(body, bg=C["BG"])
+        self._task_frame.pack(fill="x")
 
-        # 진행바
-        style.configure("Red.Horizontal.TProgressbar",
-                        troughcolor=CARD, background=HL, thickness=6)
-        self.progress = ttk.Progressbar(
-            body, style="Red.Horizontal.TProgressbar",
-            length=580, mode="determinate",
-        )
-        self.progress.pack(fill="x")
+        # 하단 버튼 영역
+        btn_row = tk.Frame(body, bg=C["BG"])
+        btn_row.pack(fill="x", pady=(10, 0))
 
-        # 상태 라벨
-        self.status_var = tk.StringVar(value="준비됨")
-        tk.Label(body, textvariable=self.status_var,
-                 bg=BG, fg=MUTED, font=("Malgun Gothic", 9), anchor="w").pack(fill="x", pady=(5, 0))
+        self._add_btn = tk.Button(btn_row, text="＋ 작업 추가",
+                                  bg=C["ACCENT"], fg=C["FG"],
+                                  font=self.FONT_B, relief="flat", padx=14, pady=6,
+                                  cursor="hand2", command=self._add_task)
+        self._add_btn.pack(side="left")
 
-    def _sec(self, parent, bg, fg, text):
-        tk.Label(parent, text=text, bg=bg, fg=fg,
-                 font=("Malgun Gothic", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 3))
+        self._all_btn = tk.Button(btn_row, text="🎬  모두 생성",
+                                  bg=C["HL"], fg="white",
+                                  font=("Malgun Gothic", 11, "bold"),
+                                  relief="flat", padx=20, pady=6,
+                                  cursor="hand2", command=self._start_all)
+        self._all_btn.pack(side="right")
 
-    # ── 카테고리 썸네일 ─────────────────────────────────────
-    def _refresh_thumb(self):
-        cat  = self.category_var.get()
-        path = BASE_DIR / f"{cat}.png"
-        photo = None
-        try:
-            photo = tk.PhotoImage(file=str(path))
-            w, h  = photo.width(), photo.height()
-            # 최대 220×124 크기에 맞게 subsample
-            s = max(1, max(w // 220, h // 124))
-            photo = photo.subsample(s, s)
-        except Exception:
-            pass
-
-        self._thumb = photo  # GC 방지
-        if photo:
-            self._thumb_lbl.config(image=photo, text="")
-        else:
-            self._thumb_lbl.config(image="", text=f"⚠ {cat}.png 미리보기 불가",
-                                   fg="#667", font=("Malgun Gothic", 8))
-
-    # ── 파일/폴더 선택 ──────────────────────────────────────
-    def _browse_podcast(self):
-        path = filedialog.askopenfilename(
-            title="팟캐스트 음성 파일 선택",
-            filetypes=[("오디오 파일", "*.mp3 *.wav *.m4a *.aac *.ogg"), ("모든 파일", "*.*")],
-        )
-        if path:
-            self.podcast_var.set(path)
-
+    # ── 저장 위치 ────────────────────────────────────────────
     def _browse_output(self):
         folder = filedialog.askdirectory(title="저장 폴더 선택")
         if folder:
@@ -351,61 +437,52 @@ class App(tk.Tk):
             self._cfg["last_output"] = folder
             save_config(self._cfg)
 
-    # ── 영상 생성 ───────────────────────────────────────────
-    def _start_generate(self):
-        podcast = self.podcast_var.get()
-        if podcast == "파일을 선택해 주세요" or not os.path.exists(podcast):
-            messagebox.showwarning("파일 없음", "팟캐스트 음성 파일을 먼저 선택해 주세요.")
+    def _get_output_dir(self) -> str:
+        return self.output_var.get()
+
+    # ── 작업 관리 ────────────────────────────────────────────
+    def _add_task(self):
+        if len(self._tasks) >= MAX_TASKS:
             return
+        idx  = len(self._tasks) + 1
+        card = TaskCard(self._task_frame, idx,
+                        get_output_dir=self._get_output_dir,
+                        on_remove=lambda c=None: self._remove_task(len(self._tasks) - 1))
+        # on_remove를 카드 생성 후 올바른 인덱스로 바인딩
+        card._on_remove = lambda: self._remove_task(self._tasks.index(card))
+        card._del_btn.config(command=card._on_remove)
+        card.pack(fill="x", pady=(0, 6))
+        self._tasks.append(card)
+        self._refresh_add_btn()
 
-        ffmpeg, _ = find_ffmpeg()
-        if not ffmpeg:
-            messagebox.showerror(
-                "FFmpeg 없음",
-                "FFmpeg 가 설치되어 있지 않습니다.\n\n"
-                "'팟캐스트 생성기 실행.bat' 파일을 통해 실행해 주세요.\n"
-                "(자동으로 설치를 시도합니다)",
-            )
+    def _remove_task(self, idx: int):
+        if idx < 0 or idx >= len(self._tasks):
             return
+        card = self._tasks[idx]
+        if card.is_running():
+            messagebox.showwarning("진행 중", "처리 중인 작업은 삭제할 수 없습니다.")
+            return
+        card.destroy()
+        self._tasks.pop(idx)
+        # 번호 재정렬
+        for i, t in enumerate(self._tasks):
+            t.set_index(i + 1)
+        self._refresh_add_btn()
 
-        category = self.category_var.get()
-        self._cfg["last_category"] = category
-        save_config(self._cfg)
+    def _refresh_add_btn(self):
+        if len(self._tasks) >= MAX_TASKS:
+            self._add_btn.config(state="disabled", fg=self.C["MUTED"])
+        else:
+            self._add_btn.config(state="normal", fg=self.C["FG"])
 
-        out_dir  = Path(self.output_var.get())
-        stem     = Path(podcast).stem
-        out_file = out_dir / f"[AI Prism] {category} - {stem}.mp4"
-
-        # 같은 이름 파일 존재 시 확인
-        if out_file.exists():
-            if not messagebox.askyesno(
-                "파일 덮어쓰기",
-                f"이미 존재하는 파일입니다:\n{out_file.name}\n\n덮어쓰겠습니까?",
-            ):
-                return
-
-        self.gen_btn.config(state="disabled")
-        self.progress["value"] = 0
-        self.status_var.set("⏳ 처리 시작 중...")
-
-        def run():
-            try:
-                build_video(
-                    category, podcast, out_file,
-                    progress_cb=lambda v: self.after(0, lambda: self.progress.configure(value=v)),
-                    log_cb=lambda m: self.after(0, lambda msg=m: self.status_var.set(msg)),
-                )
-                self.after(0, lambda: messagebox.showinfo(
-                    "완료 🎉", f"영상이 생성되었습니다!\n\n📁 {out_file}"
-                ))
-            except Exception as e:
-                self.after(0, lambda err=str(e): messagebox.showerror("오류", err))
-                self.after(0, lambda: self.status_var.set("❌ 오류 발생"))
-                self.after(0, lambda: self.progress.configure(value=0))
-            finally:
-                self.after(0, lambda: self.gen_btn.config(state="normal"))
-
-        threading.Thread(target=run, daemon=True).start()
+    # ── 모두 생성 ────────────────────────────────────────────
+    def _start_all(self):
+        ready = [t for t in self._tasks if t.is_ready() and not t.is_running()]
+        if not ready:
+            messagebox.showwarning("파일 없음", "생성할 파일이 선택된 작업이 없습니다.")
+            return
+        for task in ready:
+            task.start()
 
 
 if __name__ == "__main__":
